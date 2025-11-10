@@ -2,39 +2,32 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 
+use core::future;
+
 use embassy_executor::Spawner;
 use embassy_net::{Runner, StackResources};
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
-use embassy_time::Duration;
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
+use embassy_time::{Duration, Instant, Timer};
 
 use esp_alloc as _;
 use esp_backtrace as _;
-
+use esp_hal::clock::CpuClock;
+use esp_hal::gpio::{Level, Output, OutputConfig};
 #[cfg(target_arch = "riscv32")]
 use esp_hal::interrupt::software::SoftwareInterruptControl;
-use esp_hal::{
-  clock::CpuClock, 
-  gpio::{Level, Output, OutputConfig}, 
-  ram, 
-  rng::Rng, 
-  timer::timg::TimerGroup
-};
-
+use esp_hal::ram;
+use esp_hal::rng::Rng;
+use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
-
-use esp_radio::{
-  Controller,
-  wifi::{
-    ClientConfig, ModeConfig, WifiController, WifiDevice, WifiEvent, WifiStaState,
-  },
+use esp_radio::wifi::{
+  self, ClientConfig, ModeConfig, WifiController, WifiDevice, WifiEvent, WifiStaState,
 };
+use esp_radio::Controller;
 
-use picoserve::{
-  make_static,
-  response::Json,
-  routing::{get, post, PathRouter},
-  AppBuilder, AppRouter,
-};
+use picoserve::response::ws::{Message, SocketRx, SocketTx, WebSocketCallback};
+use picoserve::response::{Json, WebSocketUpgrade};
+use picoserve::routing::{get, PathRouter};
+use picoserve::{make_static, AppBuilder, AppRouter, Config, Router, Server};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -47,107 +40,205 @@ macro_rules! mk_static {
   }};
 }
 
-const SSID: &str = env!("SSID");
-const PASSWORD: &str = env!("PASSWORD");
-
-// Shared buzzer state
-type BuzzerMutex = Mutex<CriticalSectionRawMutex, Output<'static>>;
-
-#[derive(Clone, Copy)]
-struct SharedBuzzer(&'static BuzzerMutex);
-
-struct AppState {
-  buzzer: SharedBuzzer,
-}
-
-impl picoserve::extract::FromRef<AppState> for SharedBuzzer {
-  fn from_ref(state: &AppState) -> Self {
-    state.buzzer
-  }
-}
-
-// Response types
 #[derive(serde::Serialize)]
 struct StatusResponse {
   status: &'static str,
 }
 
-struct AppProps {
-  state: AppState,
-}
+struct AppProps;
 
 impl AppBuilder for AppProps {
   type PathRouter = impl PathRouter;
 
-  fn build_app(self) -> picoserve::Router<Self::PathRouter> {
-    use picoserve::extract::State;
-    let Self { state } = self;
-
-    picoserve::Router::new()
+  fn build_app(self) -> Router<Self::PathRouter> {
+    Router::new()
       .route(
-        "/buzz/start",
-        post(|State(SharedBuzzer(buzzer)): State<SharedBuzzer>| async move {
-          println!("Buzzer ON");
-          buzzer.lock().await.set_high();
-          Json(StatusResponse { status: "buzzing" })
-        }),
-      )
-      .route(
-        "/buzz/stop",
-        post(|State(SharedBuzzer(buzzer)): State<SharedBuzzer>| async move {
-          println!("Buzzer OFF");
-          buzzer.lock().await.set_low();
-          Json(StatusResponse { status: "stopped" })
-        }),
-      )
-      .route(
-        "/buzz/heartbeat",
-        post(|| async move {
-          Json(StatusResponse { status: "alive" })
-        }),
+        "/buzz",
+        get(async |upgrade: WebSocketUpgrade| upgrade.on_upgrade(BuzzerWebSocket)),
       )
       .route(
         "/status",
-        get(|| async move {
-          Json(StatusResponse { status: "ok" })
-        }),
+        get(|| async move { Json(StatusResponse { status: "ok" }) }),
       )
-      .with_state(state)
   }
 }
 
-const WEB_TASK_POOL_SIZE: usize = 1;
+#[derive(Clone, Copy)]
+enum BuzzerState {
+  Off,
+  On(Instant), // timestamp of last beat
+}
+
+static BUZZER_STATE: Watch<CriticalSectionRawMutex, BuzzerState, 2> =
+  Watch::new_with(BuzzerState::Off);
+
+struct BuzzerWebSocket;
+
+impl WebSocketCallback for BuzzerWebSocket {
+  async fn run<R: embedded_io_async::Read, W: embedded_io_async::Write<Error = R::Error>>(
+    self,
+    mut rx: SocketRx<R>,
+    mut tx: SocketTx<W>,
+  ) -> Result<(), W::Error> {
+    println!("websocket connected");
+    let mut buffer = [0; 128];
+
+    let close_reason = loop {
+      match rx
+        .next_message(&mut buffer, future::pending())
+        .await?
+        .ignore_never_b()
+      {
+        Ok(Message::Ping(data)) => {
+          BUZZER_STATE.sender().send(BuzzerState::On(Instant::now()));
+          tx.send_pong(data).await?;
+        }
+        Ok(Message::Close(reason)) => {
+          println!("websocket close - {reason:?}");
+          break None;
+        }
+        Ok(Message::Pong(_)) => continue,
+        Err(error) => {
+          println!("websocket error - {error:?}");
+          break Some((error.code(), "websocket error"));
+        }
+        _ => {
+          println!("got message other than heartbeat...");
+          break Some((1003, "expected ping frames only"));
+        }
+      }
+    };
+
+    // connection closed, turn off buzzer
+    BUZZER_STATE.sender().send(BuzzerState::Off);
+    println!("websocket disconnected");
+
+    tx.close(close_reason).await
+  }
+}
+
+// beep pattern for lower pitch
+const BEEP_ON_MS: u64 = 25;
+const BEEP_OFF_MS: u64 = 25;
+// stop buzzing if no message for this duration
+const MESSAGE_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[embassy_executor::task]
+async fn buzzer_task(mut buzzer: Output<'static>) -> ! {
+  let mut receiver = BUZZER_STATE.receiver().unwrap();
+  let mut is_buzzing = false;
+
+  loop {
+    let state = receiver.get().await;
+
+    match state {
+      BuzzerState::Off => {
+        if is_buzzing {
+          println!("buzzer OFF");
+          is_buzzing = false;
+          buzzer.set_low();
+        }
+        // wait for state change
+        receiver.changed().await;
+      }
+      BuzzerState::On(last_msg_time) => {
+        // see if message timeout expired
+        if Instant::now().duration_since(last_msg_time) > MESSAGE_TIMEOUT {
+          println!("buzzer OFF (timeout)");
+          BUZZER_STATE.sender().send(BuzzerState::Off);
+          is_buzzing = false;
+          buzzer.set_low();
+        } else {
+          if !is_buzzing {
+            println!("buzzer ON");
+            is_buzzing = true;
+          }
+          // generate beep pattern
+          buzzer.set_high();
+          Timer::after(Duration::from_millis(BEEP_ON_MS)).await;
+          buzzer.set_low();
+          Timer::after(Duration::from_millis(BEEP_OFF_MS)).await;
+        }
+      }
+    }
+  }
+}
+
+#[embassy_executor::task]
+async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
+  runner.run().await
+}
+
+const SSID: &str = env!("SSID");
+const PASSWORD: &str = env!("PASSWORD");
+
+#[embassy_executor::task]
+async fn connection(mut controller: WifiController<'static>) {
+  println!("starting connection task");
+  loop {
+    match wifi::sta_state() {
+      WifiStaState::Connected => {
+        controller.wait_for_event(WifiEvent::StaDisconnected).await;
+        Timer::after(Duration::from_millis(5000)).await
+      }
+      _ => {}
+    }
+
+    if !matches!(controller.is_started(), Ok(true)) {
+      let client_config = ModeConfig::Client(
+        ClientConfig::default()
+          .with_ssid(SSID.into())
+          .with_password(PASSWORD.into()),
+      );
+      controller.set_config(&client_config).unwrap();
+      println!("starting wifi");
+      controller.start_async().await.unwrap();
+      println!("wifi started!");
+    }
+    println!("connecting to wifi...");
+
+    match controller.connect_async().await {
+      Ok(_) => println!("wifi connected!"),
+      Err(e) => {
+        println!("failed to connect - {e}");
+        Timer::after(Duration::from_millis(5000)).await
+      }
+    }
+  }
+}
+
+const WEB_TASK_POOL_SIZE: usize = 2;
 
 #[embassy_executor::task(pool_size = WEB_TASK_POOL_SIZE)]
 async fn web_task(
   task_id: usize,
   stack: embassy_net::Stack<'static>,
   app: &'static AppRouter<AppProps>,
-  config: &'static picoserve::Config<Duration>,
+  config: &'static Config<Duration>,
 ) -> ! {
   let port = 80;
   let mut tcp_rx_buffer = [0; 1024];
   let mut tcp_tx_buffer = [0; 1024];
   let mut http_buffer = [0; 2048];
 
-  // Wait for network to be ready
+  // wait for network to be ready
   loop {
     if stack.is_link_up() {
       break;
     }
-    embassy_time::Timer::after(Duration::from_millis(500)).await;
+    Timer::after(Duration::from_millis(500)).await;
   }
 
   loop {
     if let Some(config) = stack.config_v4() {
-      println!("Buzzer server ready at: {}", config.address);
+      println!("server task #{task_id} listening at {}", config.address);
       break;
     }
-    embassy_time::Timer::after(Duration::from_millis(500)).await;
+    Timer::after(Duration::from_millis(500)).await;
   }
 
   loop {
-    picoserve::Server::new(app, config, &mut http_buffer)
+    Server::new(app, config, &mut http_buffer)
       .listen_and_serve(task_id, stack, port, &mut tcp_rx_buffer, &mut tcp_tx_buffer)
       .await
       .into_never()
@@ -193,24 +284,12 @@ async fn main(spawner: Spawner) -> ! {
     seed,
   );
 
-  spawner.spawn(connection(controller)).ok();
   spawner.spawn(net_task(runner)).ok();
+  spawner.spawn(connection(controller)).ok();
+  spawner.spawn(buzzer_task(buzzer)).ok();
 
-  // Create shared buzzer state wrapped in mutex
-  let shared_buzzer = SharedBuzzer(
-    mk_static!(BuzzerMutex, Mutex::new(buzzer))
-  );
+  let app = make_static!(AppRouter<AppProps>, AppProps.build_app());
 
-  // Build the picoserve app
-  let app = make_static!(
-    AppRouter<AppProps>,
-    AppProps {
-      state: AppState { buzzer: shared_buzzer }
-    }
-    .build_app()
-  );
-
-  // Configure picoserve with timeouts
   let picoserve_config = make_static!(
     picoserve::Config::<Duration>,
     picoserve::Config::new(picoserve::Timeouts {
@@ -222,49 +301,13 @@ async fn main(spawner: Spawner) -> ! {
     .keep_connection_alive()
   );
 
-  // Spawn single web server task
-  spawner.spawn(web_task(0, stack, app, picoserve_config)).ok();
+  for task_id in 0..WEB_TASK_POOL_SIZE {
+    spawner
+      .spawn(web_task(task_id, stack, app, picoserve_config))
+      .ok();
+  }
 
   loop {
-    embassy_time::Timer::after(Duration::from_secs(1)).await;
+    Timer::after(Duration::from_secs(1)).await;
   }
-}
-
-#[embassy_executor::task]
-async fn connection(mut controller: WifiController<'static>) {
-  println!("Starting connection task");
-  loop {
-    match esp_radio::wifi::sta_state() {
-      WifiStaState::Connected => {
-        controller.wait_for_event(WifiEvent::StaDisconnected).await;
-        embassy_time::Timer::after(Duration::from_millis(5000)).await
-      }
-      _ => {}
-    }
-    if !matches!(controller.is_started(), Ok(true)) {
-      let client_config = ModeConfig::Client(
-        ClientConfig::default()
-          .with_ssid(SSID.into())
-          .with_password(PASSWORD.into()),
-      );
-      controller.set_config(&client_config).unwrap();
-      println!("Starting wifi");
-      controller.start_async().await.unwrap();
-      println!("Wifi started!");
-    }
-    println!("Connecting to wifi...");
-
-    match controller.connect_async().await {
-      Ok(_) => println!("Wifi connected!"),
-      Err(e) => {
-        println!("Failed to connect: {e:?}");
-        embassy_time::Timer::after(Duration::from_millis(5000)).await
-      }
-    }
-  }
-}
-
-#[embassy_executor::task]
-async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
-  runner.run().await
 }
