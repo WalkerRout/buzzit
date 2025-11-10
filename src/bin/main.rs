@@ -1,8 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::net::Ipv4Addr;
-
+use embedded_io_async::Write;
 use embassy_executor::Spawner;
 use embassy_net::{Runner, StackResources, tcp::TcpSocket};
 use embassy_time::{Duration, Timer};
@@ -12,14 +11,20 @@ use esp_backtrace as _;
 
 #[cfg(target_arch = "riscv32")]
 use esp_hal::interrupt::software::SoftwareInterruptControl;
-use esp_hal::{clock::CpuClock, ram, rng::Rng, timer::timg::TimerGroup};
+use esp_hal::{
+  clock::CpuClock, 
+  gpio::{Level, Output, OutputConfig}, 
+  ram, 
+  rng::Rng, 
+  timer::timg::TimerGroup
+};
 
 use esp_println::println;
 
 use esp_radio::{
   Controller,
   wifi::{
-    ClientConfig, ModeConfig, ScanConfig, WifiController, WifiDevice, WifiEvent, WifiStaState,
+    ClientConfig, ModeConfig, WifiController, WifiDevice, WifiEvent, WifiStaState,
   },
 };
 
@@ -45,6 +50,9 @@ async fn main(spawner: Spawner) -> ! {
 
   esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
   esp_alloc::heap_allocator!(size: 36 * 1024);
+
+  let buzzer = Output::new(peripherals.GPIO5, Level::Low, OutputConfig::default());
+  let buzzer = mk_static!(Output<'static>, buzzer);
 
   let timg0 = TimerGroup::new(peripherals.TIMG0);
   #[cfg(target_arch = "riscv32")]
@@ -74,12 +82,22 @@ async fn main(spawner: Spawner) -> ! {
     seed,
   );
 
+  let stack = mk_static!(embassy_net::Stack<'static>, stack);
+
   spawner.spawn(connection(controller)).ok();
   spawner.spawn(net_task(runner)).ok();
+  spawner.spawn(buzzer_server(stack, buzzer)).ok();  // Add & here
 
-  let mut rx_buffer = [0; 4096];
-  let mut tx_buffer = [0; 4096];
+  loop {
+    Timer::after(Duration::from_secs(1)).await;
+  }
+}
 
+#[embassy_executor::task]
+async fn buzzer_server(
+  stack: &'static embassy_net::Stack<'static>,
+  buzzer: &'static mut Output<'static>,
+) {
   loop {
     if stack.is_link_up() {
       break;
@@ -87,65 +105,86 @@ async fn main(spawner: Spawner) -> ! {
     Timer::after(Duration::from_millis(500)).await;
   }
 
-  println!("Waiting to get IP address...");
   loop {
     if let Some(config) = stack.config_v4() {
-      println!("Got IP: {}", config.address);
+      println!("Buzzer server ready at: {}", config.address);
       break;
     }
     Timer::after(Duration::from_millis(500)).await;
   }
 
   loop {
-    Timer::after(Duration::from_millis(1_000)).await;
+    let mut rx_buffer = [0; 1024];
+    let mut tx_buffer = [0; 1024];
+    let mut socket = TcpSocket::new(*stack, &mut rx_buffer, &mut tx_buffer);  // Add * here
+    socket.set_timeout(Some(Duration::from_secs(30)));
 
-    let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-
-    socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
-
-    let remote_endpoint = (Ipv4Addr::new(142, 250, 185, 115), 80);
-    println!("connecting...");
-    let r = socket.connect(remote_endpoint).await;
-    if let Err(e) = r {
-      println!("connect error: {:?}", e);
+    println!("Listening on port 80...");
+    if let Err(e) = socket.accept(80).await {
+      println!("Accept error: {:?}", e);
+      Timer::after(Duration::from_secs(1)).await;
       continue;
     }
-    println!("connected!");
-    let mut buf = [0; 1024];
+
+    println!("Client connected!");
+
+    let mut buf = [0u8; 512];
+    let mut total_read = 0;
+
     loop {
-      use embedded_io_async::Write;
-      let r = socket
-        .write_all(b"GET / HTTP/1.0\r\nHost: www.mobile-j.de\r\n\r\n")
-        .await;
-      if let Err(e) = r {
-        println!("write error: {:?}", e);
-        break;
-      }
-      let n = match socket.read(&mut buf).await {
-        Ok(0) => {
-          println!("read EOF");
-          break;
+      match socket.read(&mut buf[total_read..]).await {
+        Ok(0) => break,
+        Ok(n) => {
+          total_read += n;
+          if total_read >= 4 && &buf[total_read-4..total_read] == b"\r\n\r\n" {
+            break;
+          }
+          if total_read >= buf.len() {
+            break;
+          }
         }
-        Ok(n) => n,
         Err(e) => {
-          println!("read error: {:?}", e);
+          println!("Read error: {:?}", e);
           break;
         }
-      };
-      println!("{}", core::str::from_utf8(&buf[..n]).unwrap());
+      }
     }
-    Timer::after(Duration::from_millis(3000)).await;
+
+    let request = core::str::from_utf8(&buf[..total_read]).unwrap_or("");
+    println!("Request: {}", &request[..request.len().min(100)]);
+
+    if request.starts_with("POST /buzz/start") {
+      buzzer.set_high();
+      println!("Buzzer ON");
+      let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"buzzing\"}";
+      let _ = socket.write_all(response).await;
+    } else if request.starts_with("POST /buzz/stop") {
+      buzzer.set_low();
+      println!("Buzzer OFF");
+      let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"stopped\"}";
+      let _ = socket.write_all(response).await;
+    } else if request.starts_with("POST /buzz/heartbeat") {
+      let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"alive\"}";
+      let _ = socket.write_all(response).await;
+    } else if request.starts_with("GET /status") {
+      let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\"}";
+      let _ = socket.write_all(response).await;
+    } else {
+      let response = b"HTTP/1.1 404 Not Found\r\n\r\n";
+      let _ = socket.write_all(response).await;
+    }
+
+    socket.close();
+    Timer::after(Duration::from_millis(100)).await;
   }
 }
 
 #[embassy_executor::task]
 async fn connection(mut controller: WifiController<'static>) {
-  println!("start connection task");
-  println!("Device capabilities: {:?}", controller.capabilities());
+  println!("Starting connection task");
   loop {
     match esp_radio::wifi::sta_state() {
       WifiStaState::Connected => {
-        // wait until we're no longer connected
         controller.wait_for_event(WifiEvent::StaDisconnected).await;
         Timer::after(Duration::from_millis(5000)).await
       }
@@ -161,23 +200,13 @@ async fn connection(mut controller: WifiController<'static>) {
       println!("Starting wifi");
       controller.start_async().await.unwrap();
       println!("Wifi started!");
-
-      println!("Scan");
-      let scan_config = ScanConfig::default().with_max(10);
-      let result = controller
-        .scan_with_config_async(scan_config)
-        .await
-        .unwrap();
-      for ap in result {
-        println!("{:?}", ap);
-      }
     }
-    println!("About to connect...");
+    println!("Connecting to wifi...");
 
     match controller.connect_async().await {
       Ok(_) => println!("Wifi connected!"),
       Err(e) => {
-        println!("Failed to connect to wifi: {e:?}");
+        println!("Failed to connect: {e:?}");
         Timer::after(Duration::from_millis(5000)).await
       }
     }
