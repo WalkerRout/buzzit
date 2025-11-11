@@ -1,12 +1,8 @@
 [package]
-name         = "buzz"
-version      = "0.1.0"
-edition      = "2021"
+name = "buzzit"
+version = "0.1.0"
+edition = "2021"
 rust-version = "1.76"
-
-[[bin]]
-name = "buzz"
-path = "src/bin/main.rs"
 
 [dependencies]
 # core esp crates

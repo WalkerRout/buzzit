@@ -92,7 +92,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "buzz"
+name = "buzzit"
 version = "0.1.0"
 dependencies = [
  "critical-section",
