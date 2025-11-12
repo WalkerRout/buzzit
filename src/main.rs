@@ -80,8 +80,9 @@ impl WebSocketCallback for BuzzerWebSocket {
     mut rx: SocketRx<R>,
     mut tx: SocketTx<W>,
   ) -> Result<(), W::Error> {
-    println!("websocket connected");
+    println!("[WS] connected");
     let mut buffer = [0; 128];
+    let mut msg_count = 0u32;
 
     let close_reason = loop {
       match rx
@@ -90,28 +91,38 @@ impl WebSocketCallback for BuzzerWebSocket {
         .ignore_never_b()
       {
         Ok(Message::Ping(data)) => {
+          msg_count += 1;
+          if msg_count % 50 == 0 {
+            println!("[WS] ping #{msg_count}");
+          }
           BUZZER_STATE.sender().send(BuzzerState::On(Instant::now()));
-          tx.send_pong(data).await?;
+          
+          if let Err(e) = tx.send_pong(data).await {
+            println!("[WS] ERROR: failed to send pong - {:?}", e);
+            break Some((1011, "pong send failed"));
+          }
         }
         Ok(Message::Close(reason)) => {
-          println!("websocket close - {reason:?}");
+          println!("[WS] close from client - {reason:?}");
           break None;
         }
-        Ok(Message::Pong(_)) => continue,
+        Ok(Message::Pong(_)) => {
+          println!("[WS] unexpected pong");
+          continue;
+        }
         Err(error) => {
-          println!("websocket error - {error:?}");
+          println!("[WS] ERROR: protocol error - {error:?}");
           break Some((error.code(), "websocket error"));
         }
         _ => {
-          println!("got message other than heartbeat...");
-          break Some((1003, "expected ping frames only"));
+          println!("[WS] WARN: unexpected message type, ignoring");
+          continue;
         }
       }
     };
 
-    // connection closed, turn off buzzer
     BUZZER_STATE.sender().send(BuzzerState::Off);
-    println!("websocket disconnected");
+    println!("[WS] disconnected (total msgs: {msg_count})");
 
     tx.close(close_reason).await
   }
@@ -290,13 +301,14 @@ async fn main(spawner: Spawner) -> ! {
 
   let app = make_static!(AppRouter<AppProps>, AppProps.build_app());
 
+  // slightly generous timeouts to handle network jitter
   let picoserve_config = make_static!(
     picoserve::Config::<Duration>,
     picoserve::Config::new(picoserve::Timeouts {
-      start_read_request: Some(Duration::from_secs(5)),
-      persistent_start_read_request: Some(Duration::from_secs(1)),
-      read_request: Some(Duration::from_secs(1)),
-      write: Some(Duration::from_secs(1)),
+      start_read_request: Some(Duration::from_secs(10)),
+      persistent_start_read_request: Some(Duration::from_secs(2)),
+      read_request: Some(Duration::from_secs(2)),
+      write: Some(Duration::from_secs(2)),
     })
     .keep_connection_alive()
   );
