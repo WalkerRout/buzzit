@@ -3,6 +3,7 @@
 #![feature(impl_trait_in_assoc_type)]
 
 use core::future;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use embassy_executor::Spawner;
 use embassy_net::{Runner, StackResources};
@@ -40,9 +41,19 @@ macro_rules! mk_static {
   }};
 }
 
+const MAX_CONCURRENT_CONNECTIONS: u32 = 4;
+
+static ACTIVE_CONNECTIONS: AtomicU32 = AtomicU32::new(0);
+static TOTAL_CONNECTIONS: AtomicU32 = AtomicU32::new(0);
+static REJECTED_CONNECTIONS: AtomicU32 = AtomicU32::new(0);
+
 #[derive(serde::Serialize)]
 struct StatusResponse {
   status: &'static str,
+  active_connections: u32,
+  total_connections: u32,
+  rejected_connections: u32,
+  free_heap: u32,
 }
 
 struct AppProps;
@@ -58,7 +69,15 @@ impl AppBuilder for AppProps {
       )
       .route(
         "/status",
-        get(|| async move { Json(StatusResponse { status: "ok" }) }),
+        get(|| async move {
+          Json(StatusResponse {
+            status: "ok",
+            active_connections: ACTIVE_CONNECTIONS.load(Ordering::Relaxed),
+            total_connections: TOTAL_CONNECTIONS.load(Ordering::Relaxed),
+            rejected_connections: REJECTED_CONNECTIONS.load(Ordering::Relaxed),
+            free_heap: esp_alloc::HEAP.free() as u32,
+          })
+        }),
       )
   }
 }
@@ -66,7 +85,7 @@ impl AppBuilder for AppProps {
 #[derive(Clone, Copy)]
 enum BuzzerState {
   Off,
-  On(Instant), // timestamp of last beat
+  On(Instant),
 }
 
 static BUZZER_STATE: Watch<CriticalSectionRawMutex, BuzzerState, 2> =
@@ -74,31 +93,74 @@ static BUZZER_STATE: Watch<CriticalSectionRawMutex, BuzzerState, 2> =
 
 struct BuzzerWebSocket;
 
+impl Drop for BuzzerWebSocket {
+  fn drop(&mut self) {
+    ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+  }
+}
+
 impl WebSocketCallback for BuzzerWebSocket {
   async fn run<R: embedded_io_async::Read, W: embedded_io_async::Write<Error = R::Error>>(
     self,
     mut rx: SocketRx<R>,
     mut tx: SocketTx<W>,
   ) -> Result<(), W::Error> {
-    println!("[WS] connected");
+    let current = ACTIVE_CONNECTIONS.load(Ordering::SeqCst);
+    
+    if current >= MAX_CONCURRENT_CONNECTIONS {
+      REJECTED_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+      println!("[WS] REJECTED: limit {}/{}", current, MAX_CONCURRENT_CONNECTIONS);
+      return tx.close(Some((1008, "server at capacity"))).await;
+    }
+    
+    ACTIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
+    TOTAL_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+    println!("[WS] connected (active: {})", current + 1);
+    
     let mut buffer = [0; 128];
     let mut msg_count = 0u32;
+    let mut last_log = Instant::now();
+    let connect_time = Instant::now();
+    let mut last_ping = Instant::now();
+    let mut last_activity = Instant::now();
 
     let close_reason = loop {
-      match rx
-        .next_message(&mut buffer, future::pending())
-        .await?
-        .ignore_never_b()
-      {
+      if Instant::now().duration_since(last_activity) > Duration::from_secs(10) {
+        println!("[WS] TIMEOUT: idle >10s");
+        break Some((1000, "idle timeout"));
+      }
+      
+      let free_heap = esp_alloc::HEAP.free();
+      if free_heap < 8192 {
+        println!("[WS] ERROR: low heap ({} bytes)", free_heap);
+        break Some((1011, "server overload"));
+      }
+      
+      match rx.next_message(&mut buffer, future::pending()).await?.ignore_never_b() {
         Ok(Message::Ping(data)) => {
-          msg_count += 1;
-          if msg_count % 50 == 0 {
-            println!("[WS] ping #{msg_count}");
+          last_activity = Instant::now();
+          let now = Instant::now();
+          
+          if now.duration_since(last_ping) < Duration::from_millis(5) {
+            continue;
           }
+          last_ping = now;
+          msg_count += 1;
+          
+          if now.duration_since(last_log) > Duration::from_secs(5) {
+            println!(
+              "[WS] stats: {} pings, uptime {}s, heap {}kb",
+              msg_count,
+              now.duration_since(connect_time).as_secs(),
+              free_heap / 1024
+            );
+            last_log = now;
+          }
+          
           BUZZER_STATE.sender().send(BuzzerState::On(Instant::now()));
           
           if let Err(e) = tx.send_pong(data).await {
-            println!("[WS] ERROR: failed to send pong - {:?}", e);
+            println!("[WS] ERROR: pong failed - {:?}", e);
             break Some((1011, "pong send failed"));
           }
         }
@@ -107,32 +169,26 @@ impl WebSocketCallback for BuzzerWebSocket {
           break None;
         }
         Ok(Message::Pong(_)) => {
-          println!("[WS] unexpected pong");
-          continue;
+          last_activity = Instant::now();
         }
         Err(error) => {
-          println!("[WS] ERROR: protocol error - {error:?}");
+          println!("[WS] ERROR: protocol - {error:?}");
           break Some((error.code(), "websocket error"));
         }
-        _ => {
-          println!("[WS] WARN: unexpected message type, ignoring");
-          continue;
-        }
+        _ => {}
       }
     };
 
     BUZZER_STATE.sender().send(BuzzerState::Off);
-    println!("[WS] disconnected (total msgs: {msg_count})");
+    println!(
+      "[WS] disconnected: {} pings, {}s",
+      msg_count,
+      Instant::now().duration_since(connect_time).as_secs()
+    );
 
     tx.close(close_reason).await
   }
 }
-
-// beep pattern for lower pitch
-const BEEP_ON_MS: u64 = 25;
-const BEEP_OFF_MS: u64 = 25;
-// stop buzzing if no message for this duration
-const MESSAGE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[embassy_executor::task]
 async fn buzzer_task(mut buzzer: Output<'static>) -> ! {
@@ -145,32 +201,47 @@ async fn buzzer_task(mut buzzer: Output<'static>) -> ! {
     match state {
       BuzzerState::Off => {
         if is_buzzing {
-          println!("buzzer OFF");
           is_buzzing = false;
           buzzer.set_low();
         }
-        // wait for state change
         receiver.changed().await;
       }
       BuzzerState::On(last_msg_time) => {
-        // see if message timeout expired
-        if Instant::now().duration_since(last_msg_time) > MESSAGE_TIMEOUT {
-          println!("buzzer OFF (timeout)");
+        if Instant::now().duration_since(last_msg_time) > Duration::from_millis(500) {
           BUZZER_STATE.sender().send(BuzzerState::Off);
           is_buzzing = false;
           buzzer.set_low();
         } else {
           if !is_buzzing {
-            println!("buzzer ON");
             is_buzzing = true;
           }
-          // generate beep pattern
           buzzer.set_high();
-          Timer::after(Duration::from_millis(BEEP_ON_MS)).await;
+          Timer::after(Duration::from_millis(25)).await;
           buzzer.set_low();
-          Timer::after(Duration::from_millis(BEEP_OFF_MS)).await;
+          Timer::after(Duration::from_millis(25)).await;
         }
       }
+    }
+  }
+}
+
+#[embassy_executor::task]
+async fn watchdog_task() -> ! {
+  loop {
+    Timer::after(Duration::from_secs(10)).await;
+    
+    let free_heap = esp_alloc::HEAP.free();
+    let active = ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
+    let total = TOTAL_CONNECTIONS.load(Ordering::Relaxed);
+    let rejected = REJECTED_CONNECTIONS.load(Ordering::Relaxed);
+    
+    println!(
+      "[WATCHDOG] heap: {}kb, conn: {}/{}, total: {}, reject: {}",
+      free_heap / 1024, active, MAX_CONCURRENT_CONNECTIONS, total, rejected
+    );
+    
+    if free_heap < 16384 {
+      println!("[WATCHDOG] WARN: low heap");
     }
   }
 }
@@ -180,12 +251,8 @@ async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
   runner.run().await
 }
 
-const SSID: &str = env!("SSID");
-const PASSWORD: &str = env!("PASSWORD");
-
 #[embassy_executor::task]
 async fn connection(mut controller: WifiController<'static>) {
-  println!("starting connection task");
   loop {
     match wifi::sta_state() {
       WifiStaState::Connected => {
@@ -198,41 +265,31 @@ async fn connection(mut controller: WifiController<'static>) {
     if !matches!(controller.is_started(), Ok(true)) {
       let client_config = ModeConfig::Client(
         ClientConfig::default()
-          .with_ssid(SSID.into())
-          .with_password(PASSWORD.into()),
+          .with_ssid(env!("SSID").into())
+          .with_password(env!("PASSWORD").into()),
       );
       controller.set_config(&client_config).unwrap();
-      println!("starting wifi");
       controller.start_async().await.unwrap();
-      println!("wifi started!");
     }
-    println!("connecting to wifi...");
 
     match controller.connect_async().await {
-      Ok(_) => println!("wifi connected!"),
-      Err(e) => {
-        println!("failed to connect - {e}");
-        Timer::after(Duration::from_millis(5000)).await
-      }
+      Ok(_) => {}
+      Err(_) => Timer::after(Duration::from_millis(5000)).await
     }
   }
 }
 
-const WEB_TASK_POOL_SIZE: usize = 2;
-
-#[embassy_executor::task(pool_size = WEB_TASK_POOL_SIZE)]
+#[embassy_executor::task(pool_size = 2)]
 async fn web_task(
   task_id: usize,
   stack: embassy_net::Stack<'static>,
   app: &'static AppRouter<AppProps>,
   config: &'static Config<Duration>,
 ) -> ! {
-  let port = 80;
   let mut tcp_rx_buffer = [0; 1024];
   let mut tcp_tx_buffer = [0; 1024];
   let mut http_buffer = [0; 2048];
 
-  // wait for network to be ready
   loop {
     if stack.is_link_up() {
       break;
@@ -242,7 +299,7 @@ async fn web_task(
 
   loop {
     if let Some(config) = stack.config_v4() {
-      println!("server task #{task_id} listening at {}", config.address);
+      println!("server task #{task_id} at {}", config.address);
       break;
     }
     Timer::after(Duration::from_millis(500)).await;
@@ -250,7 +307,7 @@ async fn web_task(
 
   loop {
     Server::new(app, config, &mut http_buffer)
-      .listen_and_serve(task_id, stack, port, &mut tcp_rx_buffer, &mut tcp_tx_buffer)
+      .listen_and_serve(task_id, stack, 80, &mut tcp_rx_buffer, &mut tcp_tx_buffer)
       .await
       .into_never()
   }
@@ -277,19 +334,15 @@ async fn main(spawner: Spawner) -> ! {
   );
 
   let esp_radio_ctrl = &*mk_static!(Controller<'static>, esp_radio::init().unwrap());
-
   let (controller, interfaces) =
     esp_radio::wifi::new(&esp_radio_ctrl, peripherals.WIFI, Default::default()).unwrap();
 
-  let wifi_interface = interfaces.sta;
-
   let config = embassy_net::Config::dhcpv4(Default::default());
-
   let rng = Rng::new();
   let seed = (rng.random() as u64) << 32 | rng.random() as u64;
 
   let (stack, runner) = embassy_net::new(
-    wifi_interface,
+    interfaces.sta,
     config,
     mk_static!(StackResources<3>, StackResources::<3>::new()),
     seed,
@@ -298,14 +351,13 @@ async fn main(spawner: Spawner) -> ! {
   spawner.spawn(net_task(runner)).ok();
   spawner.spawn(connection(controller)).ok();
   spawner.spawn(buzzer_task(buzzer)).ok();
+  spawner.spawn(watchdog_task()).ok();
 
   let app = make_static!(AppRouter<AppProps>, AppProps.build_app());
-
-  // slightly generous timeouts to handle network jitter
   let picoserve_config = make_static!(
     picoserve::Config::<Duration>,
     picoserve::Config::new(picoserve::Timeouts {
-      start_read_request: Some(Duration::from_secs(10)),
+      start_read_request: Some(Duration::from_secs(5)),
       persistent_start_read_request: Some(Duration::from_secs(2)),
       read_request: Some(Duration::from_secs(2)),
       write: Some(Duration::from_secs(2)),
@@ -313,10 +365,8 @@ async fn main(spawner: Spawner) -> ! {
     .keep_connection_alive()
   );
 
-  for task_id in 0..WEB_TASK_POOL_SIZE {
-    spawner
-      .spawn(web_task(task_id, stack, app, picoserve_config))
-      .ok();
+  for task_id in 0..2 {
+    spawner.spawn(web_task(task_id, stack, app, picoserve_config)).ok();
   }
 
   loop {
